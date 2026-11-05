@@ -1,0 +1,13 @@
+{
+  "id": "dsh-sidechat",
+  "version": "0.2.1-rc.5",
+  "main": "./lib/index.js",
+  "description": "DSH side-conversation plugin: /side and /btw start isolated forked child sessions rendered in the native right Sidebar.",
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <=0.2.1-rc.5"
+  },
+  "contributes": {
+    "tools": [],
+    "skills": []
+  }
+}

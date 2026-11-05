@@ -1,0 +1,31 @@
+import { z } from 'zod'
+import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
+import { sideCommandResult } from './command-result.ts'
+import type { SideMode } from './prompts.ts'
+
+export type SidechatModes = Readonly<Record<string, SideMode>>
+
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    sidechatModes: SidechatModes
+  }
+  interface SessionProjectionMap {
+    sidechatModes: SidechatModes
+  }
+}
+
+const schema = z.record(z.string(), z.enum(['side', 'btw']))
+
+export const sidechatModesProjection = {
+  key: 'sidechatModes',
+  stateSchema: schema,
+  init: () => ({}),
+  apply: (state, event) => {
+    if (event.type === 'session/end-seed' && event.data.inherited === true) return {}
+    if (event.type !== 'command/done') return state
+    const created = sideCommandResult(event.data)
+    return created === undefined ? state : { ...state, [created.childId]: created.mode }
+  },
+  wire: { viewSchema: schema, view: state => state },
+  stateVersion: 2,
+} satisfies ProjectionDefinition<'sidechatModes'>

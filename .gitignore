@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+.cache/
+.runtime/
+.state/
+.npm-cache/
+.pnpm-store/
+.test-home/

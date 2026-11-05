@@ -1,0 +1,58 @@
+/**
+ * Side-chat stylesheet (browser half): the CSS resources the tab body needs
+ * beyond inline styles — the running-row shimmer keyframes. Inline styles
+ * cover everything else, but `background-clip: text` sweeps need a real
+ * stylesheet, so this installs a single idempotent `<style>` tag and hands
+ * back its disposer (the plugin fiber removes it on unload — hot-unload
+ * discipline).
+ */
+
+/** The injected stylesheet body. */
+export const SIDECHAT_STYLE_CSS = `
+@keyframes dsh-sidechat-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+.dsh-sidechat-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--dsw-static-deepseek-500, #4176e6) 0%,
+    var(--dsw-static-deepseek-500, #4176e6) 40%,
+    var(--dsw-static-deepseek-200, #d3e2ff) 50%,
+    var(--dsw-static-deepseek-500, #4176e6) 60%,
+    var(--dsw-static-deepseek-500, #4176e6) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: dsh-sidechat-shimmer 1.6s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .dsh-sidechat-shimmer {
+    animation: none;
+    background: none;
+    color: inherit;
+  }
+}
+`
+
+/** The stylesheet's fixed element id (also the double-apply guard). */
+export const SIDECHAT_STYLE_ID = 'dsh-sidechat-style'
+
+/**
+ * Install the stylesheet once. Re-applying while a tag already exists (a
+ * double apply in one page) is a no-op; the returned disposer removes the tag
+ * the installer owns. Non-DOM environments (unit tests) get a no-op.
+ * @returns the disposer removing the stylesheet.
+ */
+export function installSidechatStyle(): () => void {
+  if (typeof document === 'undefined') return () => {}
+  const existing = document.getElementById(SIDECHAT_STYLE_ID)
+  if (existing !== null) return () => {}
+  const style = document.createElement('style')
+  style.id = SIDECHAT_STYLE_ID
+  style.textContent = SIDECHAT_STYLE_CSS
+  document.head.appendChild(style)
+  return () => { style.remove() }
+}

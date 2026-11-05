@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Side Chat",
+    "description": "Runs /side and /btw side conversations in a fork of the current session and shows them in the native right Sidebar."
+  }
+}

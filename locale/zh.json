@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "侧会话",
+    "description": "通过 /side 与 /btw 在当前会话的 fork 中发起侧会话，并在 DSH 原生右侧边栏中查看。"
+  }
+}
