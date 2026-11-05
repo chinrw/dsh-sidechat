@@ -22,6 +22,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
+import type { ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client'
 import { IconBranchOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { SideCommandCard, type SideCommandKind } from './SideCommandCard.tsx'
 import { SidechatHeaderButton, SidechatTab, type SidechatTabInjected } from './SidechatTab.tsx'
@@ -84,12 +85,41 @@ export function apply(ctx: Context): void {
     title: () => t('tab.title'),
     guide: [{
       id: 'sidechat',
+      commandId: 'sidechat.open' as ShortcutCommandId,
       order: 30,
       title: () => t('guide.title'),
       description: () => t('guide.description'),
       icon: IconBranchOutlineRegular,
     }],
   }), 'dsh-sidechat: Sidebar tab type')
+
+  // Keyboard entry point: the same command the guide card advertises. It opens
+  // the tab in the focused pane through the Sidebar's own target rules.
+  ctx.inject(['shortcuts'], (shortcutCtx) => {
+    shortcutCtx.effect(() => shortcutCtx.shortcuts.register({
+      id: 'sidechat.open' as ShortcutCommandId,
+      label: () => t('shortcut.open'),
+      aliases: ['side chat', 'side conversation', 'sidechain'],
+      defaults: {
+        'desktop:macos': { code: 'KeyE', modifiers: ['primary', 'shift'] },
+        'desktop:windows': { code: 'KeyE', modifiers: ['primary', 'shift'] },
+        'desktop:linux': { code: 'KeyE', modifiers: ['primary', 'shift'] },
+        'web:macos': { code: 'KeyE', modifiers: ['primary', 'shift'] },
+        'web:windows': { code: 'KeyE', modifiers: ['primary', 'shift'] },
+        'web:linux': { code: 'KeyE', modifiers: ['primary', 'shift'] },
+      },
+      regions: ['page', 'editable', 'terminal'],
+      modals: [],
+      resolve: ({ target: element }) => {
+        const target = ctx.sidebarRight.commandTarget(element)
+        if (target === undefined) return { status: 'blocked', reason: t('shortcut.noSession') }
+        return {
+          status: 'handled',
+          run: () => { ctx.sidebarRight.openTabFromTarget(SIDECHAT_KIND, target) },
+        }
+      },
+    }), 'dsh-sidechat: open shortcut')
+  })
 
   const tabInject = (_parentSessionId: SessionId): SidechatTabInjected => ({
     readTranscript(address: SubagentAddress) {

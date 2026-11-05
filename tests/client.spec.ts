@@ -120,6 +120,7 @@ describe('client apply wiring', () => {
   function fakeCtx() {
     const registered: RegisteredSlot[] = []
     const tabTypes: unknown[] = []
+    const shortcuts: unknown[] = []
     const refreshProjections = vi.fn(() => Promise.resolve())
     const registerLocale = vi.fn()
     const openTab = vi.fn()
@@ -144,6 +145,13 @@ describe('client apply wiring', () => {
           return () => {}
         },
       },
+      shortcuts: {
+        register: (command: unknown) => {
+          shortcuts.push(command)
+          return () => {}
+        },
+      },
+      inject: (_deps: string[], callback: (scoped: unknown) => void) => { callback(ctx) },
       slots: {
         register: (options: RegisteredSlot['options'], _component: unknown) => {
           registered.push({ options })
@@ -156,11 +164,11 @@ describe('client apply wiring', () => {
         },
       },
     }
-    return { ctx, registered, tabTypes, follow, page, prompt, refreshProjections, openTab }
+    return { ctx, registered, tabTypes, shortcuts, follow, page, prompt, refreshProjections, openTab }
   }
 
   it('registers the command cards, the native Sidebar tab type, its body, and the header button', () => {
-    const { ctx, registered, tabTypes } = fakeCtx()
+    const { ctx, registered, tabTypes, shortcuts } = fakeCtx()
     apply(ctx as never)
     expect(registered.map(entry => [entry.options.name, entry.options.key ?? entry.options.id]))
       .toEqual([
@@ -173,6 +181,16 @@ describe('client apply wiring', () => {
       id: '@local/dsh-sidechat',
       kind: 'sidechat',
       keepMounted: true,
+      guide: [expect.objectContaining({
+        id: 'sidechat',
+        commandId: 'sidechat.open',
+        order: 30,
+      })],
+    })])
+    // The guide card advertises a real keyboard command.
+    expect(shortcuts).toEqual([expect.objectContaining({
+      id: 'sidechat.open',
+      regions: ['page', 'editable', 'terminal'],
     })])
   })
 
