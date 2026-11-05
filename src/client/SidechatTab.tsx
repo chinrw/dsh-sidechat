@@ -57,15 +57,12 @@ import { resolveChildActivity, type ChildActivity } from './child-activity.ts'
 import { fileMentionsFor } from './sidechat-file-mentions.ts'
 import { readActivityRound } from './sidechat-activity.ts'
 import { blockText, mergeProduced, resultViewSummary } from './sidechat-view.ts'
-import type { TranscriptImage, TranscriptRow, ToolDetail } from './sidechat-view.ts'
+import type { TranscriptImage, TranscriptRead, TranscriptRow, ToolDetail } from './sidechat-view.ts'
 
 /** Business actions injected by the tab-body registration (per session scope). */
 export interface SidechatTabInjected {
   /** Fetch one child's accumulated, seed-cut transcript. */
-  readTranscript(address: SubagentAddress): Promise<{
-    rows: readonly TranscriptRow[]
-    produced: readonly string[]
-  } | null>
+  readTranscript(address: SubagentAddress): Promise<TranscriptRead | null>
   /** Fetch one running child's live activity line (light tail page). */
   readActivity(address: SubagentAddress): Promise<string | null>
   /** Deliver one human message to a continuable child. */
@@ -89,7 +86,7 @@ export type SidechatRow =
     id: SessionId
     mode: 'one-shot' | 'continuable' | 'unknown'
     command?: SideMode
-    activity: 'running' | 'inactive'
+    activity: 'running' | 'inactive' | 'unknown'
     label: string
   }
   | {
@@ -113,13 +110,16 @@ export function sidechatRows(
   return (catalog.values.subagentCatalog ?? []).map((entry): SidechatRow => {
     if (entry.mode === 'external') return { kind: 'diagnostic', id: entry.id, reason: 'unsupported' }
     const command = catalog.values.sidechatModes?.[entry.id]
+    const summary = summaries[entry.id]
     return {
       kind: 'child',
       id: entry.id,
       mode: entry.mode,
       ...(command === undefined ? {} : { command }),
-      activity: summaries[entry.id]?.running === true ? 'running' : 'inactive',
-      label: entry.label ?? summaries[entry.id]?.title ?? entry.id,
+      // A catalog entry without a session summary has no activity signal yet;
+      // reporting it as finished would hide a running child.
+      activity: summary === undefined ? 'unknown' : summary.running ? 'running' : 'inactive',
+      label: entry.label ?? summary?.title ?? entry.id,
     }
   })
 }
@@ -326,7 +326,9 @@ function Row({ row, activityText, t, onSelect }: {
   const mode = row.mode === 'unknown' ? t('mode.unknown')
     : row.mode === 'one-shot' || row.command === 'btw' ? t('mode.oneShot') : t('mode.continuable')
   const running = row.activity === 'running'
-  const activity = running ? t('activity.running') : t('activity.inactive')
+  const activity = running
+    ? t('activity.running')
+    : row.activity === 'inactive' ? t('activity.inactive') : undefined
   return (
     <button
       type="button"
@@ -335,11 +337,11 @@ function Row({ row, activityText, t, onSelect }: {
       aria-label={t('row.open', { label: row.label })}
       onClick={() => onSelect(row.id)}
     >
-      <StateDot state={running ? 'ongoing' : 'done'} />
+      <StateDot state={running ? 'ongoing' : row.activity === 'inactive' ? 'done' : 'idle'} />
       <span style={styles.content}>
         <span style={styles.label}>{row.label}</span>
         <span style={styles.summary}>
-          {`${mode} · `}
+          {activity === undefined ? mode : `${mode} · `}
           {running
             ? <span className="dsh-sidechat-shimmer">{activity}</span>
             : activity}
@@ -526,6 +528,11 @@ function TranscriptRowView({ row, streaming, codeLabels, fileMentions, t }: {
   return <ToolRow row={row} running={streaming && row.detail?.result === undefined} codeLabels={codeLabels} />
 }
 
+/** Stable identity of one selected child address. */
+function addressKeyOf(address: SubagentAddress): string {
+  return `${address.parentSessionId}:${address.childSessionId}:${address.mode}`
+}
+
 /** Poll interval for the selected child's transcript while it is running (ms). */
 const LIVE_POLL_INTERVAL_MS = 1200
 /** Poll interval for running rows' activity lines (ms). */
@@ -654,67 +661,88 @@ export function SidechatTab({
   const summaryRunning = selected === undefined ? undefined : summaries[selected]?.running
   const selectedActivity: ChildActivity = resolveChildActivity({
     catalogState: catalog?.state ?? 'absent',
-    catalogActivity: selectedChild?.activity,
+    inCatalog: selectedChild !== undefined,
+    catalogActivity: selectedChild?.activity === 'unknown' ? undefined : selectedChild?.activity,
     summaryRunning,
   })
   const selectedRunning = selectedActivity === 'running'
 
   // Stable key for the selected address (primitive — never churns with
   // unrelated list re-renders), plus refs the persistent poll reads.
-  const addressKey = address === undefined
-    ? undefined
-    : `${address.parentSessionId}:${address.childSessionId}:${address.mode}`
+  const addressKey = address === undefined ? undefined : addressKeyOf(address)
   const addressRef = useRef(address)
   addressRef.current = address
+  const addressKeyRef = useRef(addressKey)
+  addressKeyRef.current = addressKey
   const visibleRef = useRef(visible)
   visibleRef.current = visible
   const runningRef = useRef(selectedRunning)
   runningRef.current = selectedRunning
 
-  // Transcript fetch state; an epoch guard makes stale responses no-ops.
-  const [transcript, setTranscript] = useState<readonly TranscriptRow[] | null>(null)
-  const [produced, setProduced] = useState<readonly string[]>([])
+  // Transcript state is keyed by the selected address so a switch never shows
+  // the previous child's rows, files, or error while the new read is pending.
+  const [transcript, setTranscript] = useState<{ key: string; rows: readonly TranscriptRow[] } | null>(null)
+  const [produced, setProduced] = useState<{ key: string; paths: readonly string[] }>({ key: '', paths: [] })
+  const [transcriptState, setTranscriptState] = useState<{ key: string; state: 'loading' | 'ready' | 'error' }>({
+    key: '', state: 'loading',
+  })
+  const activeTranscript = transcript !== null && transcript.key === addressKey ? transcript.rows : null
+  const activeProduced = produced.key === addressKey ? produced.paths : []
+  const activeTranscriptState = transcriptState.key === addressKey ? transcriptState.state : 'loading'
   // File-mention vocabulary: files the selected child's tool calls produced,
   // resolved against the child's cwd (the main chat's ui-deliverables policy).
   const childCwd = selected === undefined ? undefined : summaries[selected]?.cwd
   const fileMentions = useMemo(
-    () => fileMentionsFor(produced, childCwd, openPath),
-    [produced, childCwd, openPath],
+    () => fileMentionsFor(activeProduced, childCwd, openPath),
+    [activeProduced, childCwd, openPath],
   )
-  const [transcriptState, setTranscriptState] = useState<'loading' | 'ready' | 'error'>('loading')
   const fetchEpoch = useRef(0)
-  // Single-flight guard: a poll tick while a fetch is still in flight is
-  // skipped (the poll interval is shorter than heavy first reads; piling up
-  // overlapping transcript requests would starve the server).
-  const fetchInFlight = useRef(false)
+  // Single-flight guard: the request that took the lock is the only one that
+  // releases it, so a stale response cannot free the slot for a newer read.
+  const fetchInFlight = useRef<{ key: string; epoch: number } | null>(null)
   const pendingFinalRead = useRef<SubagentAddress | undefined>(undefined)
   const request = useCallback((target: SubagentAddress, showLoading: boolean, final = false) => {
-    if (fetchInFlight.current && final) {
+    const key = addressKeyOf(target)
+    const inFlight = fetchInFlight.current
+    if (inFlight !== null && final) {
       pendingFinalRead.current = target
       return
     }
-    if (fetchInFlight.current && !showLoading) return
+    if (inFlight !== null && !showLoading) return
     const epoch = ++fetchEpoch.current
     if (showLoading) {
       pendingFinalRead.current = undefined
-      setTranscriptState('loading')
+      setTranscriptState({ key, state: 'loading' })
     }
-    fetchInFlight.current = true
+    fetchInFlight.current = { key, epoch }
     void actionsRef.current.readTranscript(target).then((result) => {
-      fetchInFlight.current = false
+      if (fetchInFlight.current?.epoch === epoch) fetchInFlight.current = null
       if (epoch !== fetchEpoch.current) return
-      setTranscript(result?.rows ?? null)
+      // The user switched children while this read was in flight; its result
+      // belongs to the old view and must not touch the new one.
+      if (addressKeyRef.current !== key) return
+      if (result === null) {
+        setTranscriptState({ key, state: 'error' })
+        return
+      }
+      setTranscript({ key, rows: result.rows })
       // An initial fetch replaces the vocabulary; later polls union it, so
       // produced paths whose rows slid out of the tail window keep working.
-      setProduced(previous => showLoading
-        ? (result?.produced ?? [])
-        : mergeProduced(previous, result?.produced ?? []))
-      setTranscriptState(result === null ? 'error' : 'ready')
+      setProduced(previous => ({
+        key,
+        paths: showLoading
+          ? result.produced
+          : mergeProduced(previous.key === key ? previous.paths : [], result.produced),
+      }))
+      setTranscriptState({ key, state: result.error ? 'error' : 'ready' })
       const pending = pendingFinalRead.current
       pendingFinalRead.current = undefined
       if (pending !== undefined) request(pending, false)
     })
   }, [])
+
+  // A queued final read belongs to the child it was queued for.
+  useEffect(() => { pendingFinalRead.current = undefined }, [addressKey])
 
   // Initial fetch whenever the selection or the session changes.
   useEffect(() => {
@@ -860,27 +888,40 @@ export function SidechatTab({
   // Send epoch: a prompt already in flight must never update the composer
   // after a newer send (or unmount) — the same staleness guard the polls use.
   const sendEpoch = useRef(0)
+  const sendInFlight = useRef(false)
   const send = useCallback(async () => {
     const target = addressRef.current
     if (target === undefined || target.mode !== 'continuable') return
     const text = draft.trim()
-    if (text === '') return
+    if (text === '' || sendInFlight.current) return
+    const key = addressKeyOf(target)
+    sendInFlight.current = true
     setSendFailed(false)
     const epoch = ++sendEpoch.current
-    const ok = await actionsRef.current.sendPrompt(
-      { parentSessionId: target.parentSessionId, childSessionId: target.childSessionId, mode: 'continuable' },
-      text,
-    )
-    if (epoch !== sendEpoch.current) return
-    if (!ok) {
-      // A rejected send must not eat the user's typing — restore the draft.
-      setSendFailed(true)
-      setDraft(text)
-      return
+    try {
+      const ok = await actionsRef.current.sendPrompt(
+        { parentSessionId: target.parentSessionId, childSessionId: target.childSessionId, mode: 'continuable' },
+        text,
+      )
+      if (epoch !== sendEpoch.current) return
+      // The user switched children while the prompt was in flight; the result
+      // belongs to the old view and must not clear or restore the new draft.
+      if (addressKeyRef.current !== key) return
+      if (!ok) {
+        setSendFailed(true)
+        // Restore the text only when the user has not typed something else.
+        setDraft(current => current === '' ? text : current)
+        return
+      }
+      setDraft(current => current === text ? '' : current)
+      request(target, false)
+    } finally {
+      sendInFlight.current = false
     }
-    setDraft('')
-    request(target, false)
   }, [draft, request])
+
+  // A failed send belongs to the child it was sent to.
+  useEffect(() => { setSendFailed(false) }, [addressKey])
 
   const loading = catalog === undefined
     || (catalog.state === 'loading' && rows.length === 0)
@@ -957,8 +998,8 @@ export function SidechatTab({
       ) : (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div ref={transcriptRef} style={styles.transcript} onScroll={onTranscriptScroll}>
-            {!selectedRunning && transcriptState === 'loading' && <div style={styles.notice}>{t('view.loading')}</div>}
-            {transcriptState === 'error' && (
+            {!selectedRunning && activeTranscriptState === 'loading' && <div style={styles.notice}>{t('view.loading')}</div>}
+            {activeTranscriptState === 'error' && (
               <div style={styles.error}>
                 <span>{t('view.error')}</span>
                 <button
@@ -973,10 +1014,10 @@ export function SidechatTab({
                 </button>
               </div>
             )}
-            {transcriptState === 'ready' && transcript !== null && transcript.length === 0 && !selectedRunning && (
+            {activeTranscriptState === 'ready' && activeTranscript !== null && activeTranscript.length === 0 && !selectedRunning && (
               <div style={styles.notice}>{t('view.empty')}</div>
             )}
-            {(transcript ?? []).map((row, index, all) => (
+            {(activeTranscript ?? []).map((row, index, all) => (
               <TranscriptRowView
                 key={`${row.kind}:${row.seq}:${index}`}
                 row={row}

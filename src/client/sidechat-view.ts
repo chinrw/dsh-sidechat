@@ -315,22 +315,23 @@ export function producedPaths(entries: readonly TranscriptEntry[]): string[] {
   // contains the inherited parent history, whose write/edit calls would
   // otherwise leak the PARENT's produced files into this child's vocabulary.
   const seedEnd = transcriptSeedEnd(entries.map(entry => entry.event))
-  // Calls whose result failed produced nothing to open (ui-deliverables
-  // policy: failed calls do not count).
-  const failedCallIds = new Set<string>()
+  // Only a call whose result arrived without an error produced a file; a call
+  // still in flight or one that failed contributes nothing.
+  const succeededCallIds = new Set<string>()
   for (let i = seedEnd + 1; i < entries.length; i++) {
     const event = entries[i]?.event
     if (event === undefined || event.type !== 'tool/result') continue
     const message = event.data.message
     const callId = message.toolCallId
     if (callId === undefined) continue
-    if (event.data.error !== undefined || message.isError === true) failedCallIds.add(callId)
+    if (event.data.error !== undefined || message.isError === true) continue
+    succeededCallIds.add(callId)
   }
   const paths: string[] = []
   const seen = new Set<string>()
   for (let i = seedEnd + 1; i < entries.length; i++) {
     const entry = entries[i] as TranscriptEntry
-    if (entry.event.type !== 'tool/call' || failedCallIds.has(entry.event.data.callId)) continue
+    if (entry.event.type !== 'tool/call' || !succeededCallIds.has(entry.event.data.callId)) continue
     // Alpha keeps tool presentation in the client UI; recover common write
     // and edit path fields so file mentions still work in this custom view.
     if (!/(write|edit|replace|patch|create)/i.test(entry.event.data.name)) continue
@@ -388,64 +389,36 @@ export function mergeProduced(
  * @returns display rows plus the produced-file vocabulary, or null on
  *   transport/business failure.
  */
-export async function fetchTranscript(
-  sessions: SessionRemote,
-  address: SubagentAddress,
-): Promise<{ rows: readonly TranscriptRow[]; produced: readonly string[] } | null> {
-  const entries = await fetchSeedCutEntries(
-    sessions, address, TRANSCRIPT_PAGE_MESSAGES,
-  )
-  if (entries === null) return null
-  const previous = transcriptEntryCache.get(address.childSessionId) ?? []
-  const bySeq = new Map(previous.map(entry => [entry.event.seq, entry]))
-  for (const entry of entries) {
-    if (entry.event.type !== 'assistant/live-chunk') bySeq.set(entry.event.seq, entry)
-  }
-  const transcript = [...bySeq.values()].sort((a, b) => a.event.seq - b.event.seq)
-  transcriptEntryCache.set(address.childSessionId, transcript)
-  const live = entries.filter(entry => entry.event.type === 'assistant/live-chunk')
-  const rows = await hydrateTranscriptImages(sessions, address.childSessionId, transcriptRows([...transcript, ...live]))
-  return {
-    rows,
-    produced: producedPaths(transcript),
-  }
+/** One child's contiguous child-owned history. */
+interface TranscriptCoverage {
+  /** Lowest child-owned seq held. */
+  readonly fromSeq: number
+  /** Highest seq held; every child-owned event in [fromSeq, throughSeq] is present. */
+  readonly throughSeq: number
+  readonly entries: readonly TranscriptEntry[]
 }
 
-/**
- * Fetch one running child's live activity line (latest assistant text or
- * last tool call) from a light seed-cut tail page — the list-row preview
- * poll, kept much cheaper than the full transcript page (no produced
- * vocabulary, fewer pages).
- * @param sessions - the api client's sessions surface.
- * @param address - durable parent/child address (only the child id is used).
- * @returns the activity line, or null on transport/business failure or an
- *   empty tail.
- */
-export async function fetchActivity(
-  sessions: SessionRemote,
-  address: SubagentAddress,
-): Promise<string | null> {
-  const entries = await fetchSeedCutEntries(
-    sessions, address, ACTIVITY_PAGE_MESSAGES, ACTIVITY_PAGE_CAP,
-  )
-  if (entries === null) return null
-  return lastActivity(transcriptRows(entries)) ?? null
+/** Result of one transcript read. */
+export interface TranscriptRead {
+  rows: readonly TranscriptRow[]
+  produced: readonly string[]
+  /** True when the rows cover every child-owned event up to the read snapshot. */
+  complete: boolean
+  /** True when the read failed but cached content is still returned. */
+  error: boolean
 }
 
-/**
- * Per-child seed-boundary cache: the seq of the marker before the child's
- * first boundary. Once the first walk locates it, every later read needs at
- * most ONE page and the dense inherited seed is never re-downloaded.
- */
+/** Per-child seed boundary: the seq of the marker before the child's first boundary prompt. */
 const seedBoundaryCache = new Map<string, number>()
-/** Child-owned history accumulated from cheap tail polls. */
-const transcriptEntryCache = new Map<string, readonly TranscriptEntry[]>()
-const imageUrlCache = new Map<string, string | null>()
+/** Contiguous child-owned history accumulated so far. */
+const transcriptCoverage = new Map<string, TranscriptCoverage>()
+/** Successfully resolved attachment data URLs; failures are retried on the next read. */
+const imageUrlCache = new Map<string, string>()
 
-/** Test seam: drop cached seed boundaries and accumulated transcripts. */
+/** Test seam: drop cached seed boundaries, coverage, and attachment URLs. */
 export function resetSeedBoundaryCache(): void {
   seedBoundaryCache.clear()
-  transcriptEntryCache.clear()
+  transcriptCoverage.clear()
   imageUrlCache.clear()
 }
 
@@ -469,14 +442,11 @@ async function hydrateTranscriptImages(
         sessionId: childSessionId,
         attachmentId: ref.attachmentId,
       })
-      if (!response.ok) {
-        imageUrlCache.set(id, null)
-        return
-      }
+      if (!response.ok) return
       const data = response.value.data
       imageUrlCache.set(id, data.startsWith('data:') ? data : `data:${ref.mediaType};base64,${data}`)
     } catch {
-      imageUrlCache.set(id, null)
+      // A transient failure is retried on the next read.
     }
   }))
 
@@ -486,48 +456,63 @@ async function hydrateTranscriptImages(
       ...row,
       images: row.images.map(image => {
         const url = imageUrlCache.get(String(image.attachment.attachmentId))
-        return { ...image, ...(typeof url === 'string' ? { url } : {}) }
+        return { ...image, ...(url === undefined ? {} : { url }) }
       }),
     }
   })
 }
 
+/** One backward read of a child's log. */
+interface HistoryRead {
+  /** Newly fetched child-owned entries, oldest first. */
+  readonly entries: readonly TranscriptEntry[]
+  /** Lowest fetched child-owned seq. */
+  readonly fromSeq: number
+  /** Highest fetched seq (the previous coverage when nothing new was collected). */
+  readonly throughSeq: number
+  /** Whether the fetched range is contiguous with the previous coverage or reached the boundary/start. */
+  readonly complete: boolean
+  /** Live assistant-stream chunks for rendering only; never stored as coverage. */
+  readonly live: readonly TranscriptEntry[]
+}
+
 /**
- * Page a child's log backwards from the tail in small windows until a window
- * contains the first boundary prompt, then return everything after the seed
- * marker before that prompt — the child's own conversation only.
+ * Read a child's own conversation backwards from the current snapshot.
  *
  * The host pages strictly backward (`beforeSeq` is an exclusive upper bound),
- * so there is no "start after the boundary" fetch: the first read walks back
- * until a window contains the boundary. Later reads fetch one tail window and
- * cut with the cached seed marker. Overlap between pages is deduped by
- * sequence, so an inclusive `beforeSeq` contract on the host is harmless.
+ * so a read walks from the tail until it reaches the seed boundary, the start
+ * of the log, or the previously covered range. Only a read that reaches one of
+ * those points is `complete`; a read that stops at the page cap or fails a page
+ * leaves the caller's coverage untouched.
  * @param sessions - the api client's sessions surface.
- * @param childSessionId - the child whose own conversation to read.
+ * @param childAddress - durable parent/child address.
  * @param pageMessages - messages per backward page.
- * @param pageCap - optional backward-page cap for lightweight callers. The
- *   transcript read omits it and continues until the seed boundary.
- * @returns the seed-cut entries, or null on transport/business failure.
+ * @param pageCap - optional backward-page cap for lightweight callers.
+ * @param tailOnly - stop after the first page once the boundary is cached;
+ *   activity previews only need the tail.
+ * @returns the fetched range, or null on transport/business failure.
  */
-async function fetchSeedCutEntries(
+async function readChildHistory(
   sessions: SessionRemote,
   childAddress: SubagentAddress,
   pageMessages: number,
   pageCap?: number,
-): Promise<readonly TranscriptEntry[] | null> {
+  tailOnly = false,
+): Promise<HistoryRead | null> {
   const childSessionId = childAddress.childSessionId
-  const cachedBoundary = seedBoundaryCache.get(childSessionId)
-  const collected: TranscriptEntry[] = []
-  let beforeSeq: number | undefined
-  let boundarySeq = cachedBoundary
+  const previous = transcriptCoverage.get(childSessionId)
   const address: SessionAddress = {
     kind: 'subagent',
     parentSessionId: childAddress.parentSessionId,
     childSessionId,
     mode: childAddress.mode,
   }
-  let throughSeq: number | undefined
+  const collected: TranscriptEntry[] = []
   const live: TranscriptEntry[] = []
+  let boundarySeq = seedBoundaryCache.get(childSessionId)
+  let throughSeq: number | undefined
+  let beforeSeq: number | undefined
+  let complete = false
   try {
     for (let page = 0; page < (pageCap ?? Number.POSITIVE_INFINITY); page++) {
       let records: readonly SessionHistoryRecord[]
@@ -562,46 +547,163 @@ async function fetchSeedCutEntries(
         hasMore = response.value.hasMore
       }
       const events = expandHistoryRecords(records)
-      if (events.length === 0) break
+      if (events.length === 0) {
+        complete = true
+        break
+      }
       const olderThan = collected.length > 0 ? collected[0]!.event.seq : undefined
       const fresh = olderThan === undefined
         ? events
         : events.filter(entry => entry.event.seq < olderThan)
-      if (boundarySeq !== undefined) {
-        // Cached boundary + a window without the marker: the window is
-        // entirely the child's own content — the seq filter is a safe no-op.
-        const boundary = boundarySeq
-        collected.unshift(...fresh.filter(entry => entry.event.seq > boundary))
+      if (fresh.length === 0) {
+        complete = true
         break
       }
-      const boundaryIndex = fresh.findIndex(entry => isSideBoundaryEvent(entry.event))
-      if (boundaryIndex >= 0) {
-        for (let i = boundaryIndex - 1; i >= 0; i--) {
-          if (fresh[i]?.event.type !== 'session/end-seed') continue
-          boundarySeq = fresh[i]!.event.seq
+      if (boundarySeq !== undefined) {
+        // The boundary is known: keep only child-owned events and stop once a
+        // page reaches it.
+        const boundary = boundarySeq
+        collected.unshift(...fresh.filter(entry => entry.event.seq > boundary))
+        if (tailOnly || fresh[0]!.event.seq <= boundary) {
+          complete = true
+          break
+        }
+      } else {
+        const boundaryIndex = fresh.findIndex(entry => isSideBoundaryEvent(entry.event))
+        if (boundaryIndex >= 0) {
+          // Keep the boundary prompt (the row mapper strips it) and drop the
+          // inherited seed before it.
+          let cut = boundaryIndex
+          for (let i = boundaryIndex - 1; i >= 0; i--) {
+            if (fresh[i]?.event.type !== 'session/end-seed') continue
+            boundarySeq = fresh[i]!.event.seq
+            seedBoundaryCache.set(childSessionId, boundarySeq)
+            cut = i + 1
+            break
+          }
+          collected.unshift(...fresh.slice(cut))
+          complete = true
+          break
+        }
+        const seedEnd = lastSeedEnd(fresh.map(entry => entry.event))
+        if (seedEnd >= 0 && hasMore === false) {
+          // Legacy/no-boundary logs have no stronger ownership marker.
+          boundarySeq = fresh[seedEnd]!.event.seq
           seedBoundaryCache.set(childSessionId, boundarySeq)
+          collected.unshift(...fresh.slice(seedEnd + 1))
+          complete = true
           break
         }
         collected.unshift(...fresh)
+      }
+      // A page that overlaps the previously covered range closes the gap.
+      if (previous !== undefined && collected.length > 0 && collected[0]!.event.seq <= previous.throughSeq) {
+        complete = true
         break
       }
-      const seedEnd = lastSeedEnd(fresh.map(entry => entry.event))
-      if (seedEnd >= 0 && hasMore === false) {
-        // Legacy/no-boundary logs have no stronger ownership marker.
-        boundarySeq = fresh[seedEnd]!.event.seq
-        seedBoundaryCache.set(childSessionId, boundarySeq)
-        collected.unshift(...fresh.slice(seedEnd + 1))
+      if (!hasMore) {
+        complete = true
         break
       }
-      collected.unshift(...fresh)
-      if (!hasMore) break
-      if (fresh.length === 0) break
       beforeSeq = fresh[0]!.event.seq
     }
   } catch {
     return null
   }
-  return [...collected, ...live]
+  const fromSeq = collected.length > 0 ? collected[0]!.event.seq : (previous?.fromSeq ?? 0)
+  const highest = collected.length > 0
+    ? collected[collected.length - 1]!.event.seq
+    : (previous?.throughSeq ?? throughSeq ?? 0)
+  return { entries: collected, fromSeq, throughSeq: highest, complete, live }
+}
+
+/**
+ * Fetch a child's transcript.
+ *
+ * Reads through the Session Remote without activating the child or changing
+ * the current session. The returned rows always cover a contiguous range; the
+ * `complete` flag says whether that range reaches the current snapshot, and
+ * `error` says whether the last read failed while cached content was kept.
+ * @param sessions - the api client's sessions surface.
+ * @param address - durable parent/child address (only the child id is used).
+ * @returns the rows plus coverage state, or null when nothing is cached and the read failed.
+ */
+export async function fetchTranscript(
+  sessions: SessionRemote,
+  address: SubagentAddress,
+): Promise<TranscriptRead | null> {
+  const read = await readChildHistory(sessions, address, TRANSCRIPT_PAGE_MESSAGES)
+  const previous = transcriptCoverage.get(address.childSessionId)
+  if (read === null) {
+    if (previous === undefined) return null
+    const rows = await hydrateTranscriptImages(sessions, address.childSessionId, transcriptRows(previous.entries))
+    return { rows, produced: producedPaths(previous.entries), complete: false, error: true }
+  }
+  let coverage = previous
+  if (read.entries.length > 0) {
+    if (previous === undefined || read.fromSeq <= previous.throughSeq) {
+      // A first read, or a read that overlaps the covered range: the union is
+      // contiguous.
+      const bySeq = new Map((previous?.entries ?? []).map(entry => [entry.event.seq, entry]))
+      for (const entry of read.entries) bySeq.set(entry.event.seq, entry)
+      const entries = [...bySeq.values()].sort((a, b) => a.event.seq - b.event.seq)
+      coverage = {
+        fromSeq: previous === undefined ? read.fromSeq : Math.min(previous.fromSeq, read.fromSeq),
+        throughSeq: previous === undefined ? read.throughSeq : Math.max(previous.throughSeq, read.throughSeq),
+        entries,
+      }
+    } else if (read.complete) {
+      // The read reached the boundary or the start, so it covers the previous
+      // range as well.
+      coverage = { fromSeq: read.fromSeq, throughSeq: read.throughSeq, entries: read.entries }
+    }
+    // A gap that did not reach a known edge keeps the previous coverage; the
+    // next read retries the missing range.
+  }
+  if (coverage === undefined) {
+    // No durable child-owned event yet; a live stream can still render, and a
+    // complete read of an empty log is an empty transcript rather than a
+    // failure.
+    if (read.live.length === 0) {
+      if (!read.complete) return null
+      return { rows: [], produced: [], complete: true, error: false }
+    }
+    const rows = await hydrateTranscriptImages(sessions, address.childSessionId, transcriptRows(read.live))
+    return { rows, produced: [], complete: read.complete, error: !read.complete }
+  }
+  transcriptCoverage.set(address.childSessionId, coverage)
+  const rows = await hydrateTranscriptImages(
+    sessions,
+    address.childSessionId,
+    transcriptRows([...coverage.entries, ...read.live]),
+  )
+  return {
+    rows,
+    produced: producedPaths(coverage.entries),
+    complete: read.complete,
+    error: !read.complete,
+  }
+}
+
+/**
+ * Fetch one running child's live activity line (latest assistant text or
+ * last tool call) from a light seed-cut tail page — the list-row preview
+ * poll, kept much cheaper than the full transcript page (no produced
+ * vocabulary, fewer pages).
+ * @param sessions - the api client's sessions surface.
+ * @param address - durable parent/child address (only the child id is used).
+ * @returns the activity line, or null on transport/business failure or an
+ *   empty tail.
+ */
+export async function fetchActivity(
+  sessions: SessionRemote,
+  address: SubagentAddress,
+): Promise<string | null> {
+  const read = await readChildHistory(
+    sessions, address, ACTIVITY_PAGE_MESSAGES, ACTIVITY_PAGE_CAP, true,
+  )
+  if (read === null) return null
+  return lastActivity(transcriptRows(read.entries)) ?? null
 }
 
 /** Read durable events from the Remote journal envelopes. */

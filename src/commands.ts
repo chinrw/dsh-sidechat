@@ -42,8 +42,6 @@ export function createSidechatCommands(
       recordInput: false,
       input: { hint: '<question>', attachments: true },
       handler: async ({ agent, rawInput, attachments, signal }) => {
-        const missing = missingProvider()
-        if (missing !== undefined) return { kind: 'error', text: missing }
         const arg = rawInput.trim()
         if (arg === 'list' || arg === 'ls') {
           try {
@@ -57,6 +55,8 @@ export function createSidechatCommands(
         if (arg === '') {
           return { kind: 'error', text: '/side requires a question: /side <question>' }
         }
+        const missing = missingProvider()
+        if (missing !== undefined) return { kind: 'error', text: missing }
         try {
           const reservedChildId = settlementSilence.reserveChild(agent)
           const { childId } = await startSideConversation(
@@ -92,12 +92,14 @@ export function createSidechatCommands(
           // session input stays free, nothing is awaited past the start.
           const reservedChildId = settlementSilence.reserveChild(agent)
           const run = await askSideOneShot(subagents, agent, question, deps, signal, attachments, reservedChildId)
-          // Stop this child's settlement notice at the parent inbox boundary;
-          // the child remains visible in the native Sidebar tab.
-          settlementSilence.noteChild(agent, run.childId)
+          // Install the release chain before any bookkeeping that can fail, so
+          // a failed registry write cannot leak the activation.
           void run.result
             .catch(() => { /* settlement failure still needs the release */ })
             .then(() => run.dispose().catch(() => { /* disposal must not mask the command result */ }))
+          // Stop this child's settlement notice at the parent inbox boundary;
+          // the child remains visible in the native Sidebar tab.
+          settlementSilence.noteChild(agent, run.childId)
           // The trailing id is the machine-readable jump target for the client card.
           return { kind: 'success', text: `BTW question started: ${run.childId}.` }
         } catch (error) {

@@ -3,7 +3,7 @@
  * settlements stop before they enter the parent inbox, everything else passes.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -43,15 +43,27 @@ function fakeAgent(): Agent & { delivered: { method: string; message: UserMessag
 
 function setup(liveAgents: Agent[] = []) {
   const created = { handler: undefined as ((payload: { agent: Agent }) => void) | undefined }
-  const dispose = vi.fn()
+  const disposed = { handler: undefined as ((payload: { agent: Agent }) => void) | undefined }
+  const createdDispose = vi.fn()
+  const disposedDispose = vi.fn()
   const ctx = {
     agents: { list: () => liveAgents },
     on: (name: string, handler: unknown) => {
-      if (name === 'agent/created') created.handler = handler as (payload: { agent: Agent }) => void
-      return dispose
+      if (name === 'agent/created') {
+        created.handler = handler as (payload: { agent: Agent }) => void
+        return createdDispose
+      }
+      if (name === 'agent/disposed') {
+        disposed.handler = handler as (payload: { agent: Agent }) => void
+        return disposedDispose
+      }
+      return vi.fn()
     },
   }
-  return { silence: createSettlementSilence(ctx as never), created, dispose }
+  return {
+    silence: createSettlementSilence(ctx as never),
+    created, disposed, createdDispose, disposedDispose,
+  }
 }
 
 beforeEach(() => {
@@ -118,14 +130,37 @@ describe('createSettlementSilence', () => {
     expect(liveParent.delivered).toEqual([])
   })
 
-  it('restores patched delivery methods and removes the created listener on dispose', () => {
-    const { silence, dispose } = setup()
+  it('restores patched delivery methods and removes both listeners on dispose', () => {
+    const { silence, createdDispose, disposedDispose } = setup()
     const parent = fakeAgent()
     silence.noteChild(parent, SIDE)
     silence.dispose()
     parent.followup(notice(SIDE))
     expect(parent.delivered).toEqual([{ method: 'followup', message: notice(SIDE) }])
-    expect(dispose).toHaveBeenCalledTimes(1)
+    expect(createdDispose).toHaveBeenCalledTimes(1)
+    expect(disposedDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('restores a disposed agent before the plugin unloads', () => {
+    const { silence, disposed } = setup()
+    const parent = fakeAgent()
+    silence.noteChild(parent, SIDE)
+    disposed.handler!({ agent: parent })
+    parent.followup(notice(SIDE))
+    expect(parent.delivered).toEqual([{ method: 'followup', message: notice(SIDE) }])
+    silence.dispose()
+  })
+
+  it('leaves a later wrapper in place when restoring', () => {
+    const { silence, disposed } = setup()
+    const parent = fakeAgent()
+    silence.noteChild(parent, SIDE)
+    const later = vi.fn()
+    ;(parent as unknown as Record<string, unknown>).followup = later
+    disposed.handler!({ agent: parent })
+    parent.followup(notice(SIDE))
+    expect(later).toHaveBeenCalledTimes(1)
+    silence.dispose()
   })
 })
 
@@ -142,6 +177,27 @@ describe('durable child-id registry', () => {
     mkdirSync(join(blockedHome, 'sidechat-children.json'), { recursive: true })
     vi.stubEnv('DSH_HOME', blockedHome)
     expect(() => silence.reserveChild(fakeAgent())).toThrow()
+    silence.dispose()
+  })
+
+  it('does not rewrite the registry for an already recorded child', () => {
+    const { silence } = setup()
+    const parent = fakeAgent()
+    silence.noteChild(parent, SIDE)
+    // A second save would fail against this blocked home; the idempotent
+    // noteChild must not attempt it.
+    const blockedHome = join(process.env.DSH_HOME!, 'blocked')
+    mkdirSync(join(blockedHome, 'sidechat-children.json'), { recursive: true })
+    vi.stubEnv('DSH_HOME', blockedHome)
+    expect(() => silence.noteChild(parent, SIDE)).not.toThrow()
+    silence.dispose()
+  })
+
+  it('leaves no temporary file behind after a save', () => {
+    const { silence } = setup()
+    silence.noteChild(fakeAgent(), SIDE)
+    const names = readdirSync(process.env.DSH_HOME!)
+    expect(names.filter(name => name.includes('.tmp-'))).toEqual([])
     silence.dispose()
   })
 

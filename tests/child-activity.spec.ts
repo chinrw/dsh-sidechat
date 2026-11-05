@@ -6,6 +6,7 @@ describe('resolveChildActivity', () => {
     it('returns unknown when no catalog has been fetched (absent)', () => {
       expect(resolveChildActivity({
         catalogState: 'absent',
+        inCatalog: false,
         catalogActivity: undefined,
         summaryRunning: undefined,
       })).toBe('unknown')
@@ -14,6 +15,7 @@ describe('resolveChildActivity', () => {
     it('returns unknown while the catalog is loading', () => {
       expect(resolveChildActivity({
         catalogState: 'loading',
+        inCatalog: false,
         catalogActivity: undefined,
         summaryRunning: undefined,
       })).toBe('unknown')
@@ -22,6 +24,7 @@ describe('resolveChildActivity', () => {
     it('returns unknown when the catalog fetch errored', () => {
       expect(resolveChildActivity({
         catalogState: 'error',
+        inCatalog: false,
         catalogActivity: undefined,
         summaryRunning: undefined,
       })).toBe('unknown')
@@ -30,6 +33,7 @@ describe('resolveChildActivity', () => {
     it('returns inactive when a ready catalog has no entry for the child', () => {
       expect(resolveChildActivity({
         catalogState: 'ready',
+        inCatalog: false,
         catalogActivity: undefined,
         summaryRunning: undefined,
       })).toBe('inactive')
@@ -40,6 +44,7 @@ describe('resolveChildActivity', () => {
     it('uses summaryRunning=true even when the catalog is missing', () => {
       expect(resolveChildActivity({
         catalogState: 'absent',
+        inCatalog: false,
         catalogActivity: undefined,
         summaryRunning: true,
       })).toBe('running')
@@ -50,6 +55,7 @@ describe('resolveChildActivity', () => {
       // "the child just ended and the catalog hasn't caught up" case.
       expect(resolveChildActivity({
         catalogState: 'ready',
+        inCatalog: false,
         catalogActivity: 'running',
         summaryRunning: false,
       })).toBe('inactive')
@@ -58,9 +64,23 @@ describe('resolveChildActivity', () => {
     it('uses summaryRunning=true over a stale inactive catalog entry', () => {
       expect(resolveChildActivity({
         catalogState: 'ready',
+        inCatalog: false,
         catalogActivity: 'inactive',
         summaryRunning: true,
       })).toBe('running')
+    })
+  })
+
+  describe('in-catalog without an activity signal', () => {
+    it('returns unknown when the child is listed but no summary has arrived', () => {
+      // The catalog proves the child exists; reporting it as finished would
+      // hide a running child until the summary row lands.
+      expect(resolveChildActivity({
+        catalogState: 'ready',
+        inCatalog: true,
+        catalogActivity: undefined,
+        summaryRunning: undefined,
+      })).toBe('unknown')
     })
   })
 
@@ -68,6 +88,7 @@ describe('resolveChildActivity', () => {
     it('returns running when the catalog entry is running and no summary is available', () => {
       expect(resolveChildActivity({
         catalogState: 'ready',
+        inCatalog: false,
         catalogActivity: 'running',
         summaryRunning: undefined,
       })).toBe('running')
@@ -76,6 +97,7 @@ describe('resolveChildActivity', () => {
     it('returns inactive when the catalog entry is inactive and no summary is available', () => {
       expect(resolveChildActivity({
         catalogState: 'ready',
+        inCatalog: false,
         catalogActivity: 'inactive',
         summaryRunning: undefined,
       })).toBe('inactive')
@@ -101,6 +123,7 @@ describe('resolveChildActivity', () => {
       it(`does not start a poll when the child is freshly created and the catalog is ${label}`, () => {
         const activity = resolveChildActivity({
           catalogState: state,
+          inCatalog: false,
           catalogActivity: undefined,
           summaryRunning: undefined,
         })

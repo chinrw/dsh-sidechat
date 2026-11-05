@@ -78,25 +78,50 @@ export function observeCreatedChildren(
 }
 
 /**
- * The command card. It is presentation plus one live behavior: a command that
- * settles after this card mounted opens the native Sidebar tab once, with the
- * created child selected. History replay (a command older than the mount)
- * never opens anything.
+ * Whether a settled command should open the tab: only a command this card
+ * watched run (pending → success) opens automatically. A command that is
+ * already settled when the card first renders is history replay and must not
+ * steal focus.
+ * @param input - the created child, whether the card saw the command pending,
+ *   and whether it already opened this command.
+ * @returns whether to open the tab now.
+ */
+export function shouldOpenCreatedChild(input: {
+  child: SessionId | undefined
+  pendingSeen: boolean
+  alreadyOpened: boolean
+}): boolean {
+  return input.child !== undefined && input.pendingSeen && !input.alreadyOpened
+}
+
+/**
+ * The command card. It is presentation plus one live behavior: a command this
+ * card watched run opens the native Sidebar tab once, with the created child
+ * selected. History replay never opens anything.
  */
 export function SideCommandCard({ node, onOpen, t }: SideCommandCardProps): JSX.Element {
   const kind: SideCommandKind = node.name === 'btw' ? 'btw' : 'side'
   const outcome = node.outcome
   const child = resolveChildSessionId(node, kind)
-  const startedAt = useRef(Date.now())
+  const pendingSeen = useRef(new Set<string>())
   const opened = useRef(new Set<string>())
 
+  // Record that this card watched the command run. A command that mounts
+  // already settled never enters the set, so history replay stays quiet.
   useEffect(() => {
-    if (child === undefined || onOpen === undefined) return
-    if (node.time < startedAt.current) return
-    if (opened.current.has(node.commandId)) return
+    if (node.outcome === null) pendingSeen.current.add(node.commandId)
+  }, [node.outcome, node.commandId])
+
+  useEffect(() => {
+    if (onOpen === undefined || child === undefined) return
+    if (!shouldOpenCreatedChild({
+      child,
+      pendingSeen: pendingSeen.current.has(node.commandId),
+      alreadyOpened: opened.current.has(node.commandId),
+    })) return
     opened.current.add(node.commandId)
     onOpen(child, kind)
-  }, [child, kind, node.commandId, node.time, onOpen])
+  }, [child, kind, node.commandId, onOpen])
 
   const label = outcome === null
     ? '…'

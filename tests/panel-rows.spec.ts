@@ -43,7 +43,7 @@ describe('sidechatRows', () => {
     const rows = sidechatRows(snapshot([
       { id: CHILD_A, createdAt: 0, mode: 'one-shot' },
     ]), {})
-    expect(rows[0]).toEqual({ kind: 'child', id: CHILD_A, mode: 'one-shot', activity: 'inactive', label: CHILD_A })
+    expect(rows[0]).toEqual({ kind: 'child', id: CHILD_A, mode: 'one-shot', activity: 'unknown', label: CHILD_A })
   })
 
   it('uses command identity rather than an editable title for BTW presentation', () => {

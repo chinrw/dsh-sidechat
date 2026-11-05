@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionEventLike as SessionEvent } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
 import {
-  blockText, fetchTranscript, mergeProduced, producedPaths, resetSeedBoundaryCache,
+  blockText, fetchActivity, fetchTranscript, mergeProduced, producedPaths, resetSeedBoundaryCache,
   resultViewSummary, sendPrompt, transcriptRows,
 } from '../src/client/sidechat-view'
 import type { TranscriptEntry } from '../src/client/sidechat-view'
@@ -201,11 +201,21 @@ describe('resultViewSummary', () => {
 describe('producedPaths', () => {
   it('collects diff and edit-call locations in first-seen order, deduped', () => {
     const entries = [
-      { event: event('tool/call', 1, { name: 'write', arguments: '{"file_path":"src/a.ts"}' }) },
-      { event: event('tool/call', 2, { name: 'edit', arguments: '{"file_path":"src/b.ts","path":"src/a.ts"}' }) },
-      { event: event('tool/call', 3, { name: 'read', arguments: '{"path":"src/c.ts"}' }) },
+      { event: event('tool/call', 1, { name: 'write', arguments: '{"file_path":"src/a.ts"}', callId: 'c1' }) },
+      { event: event('tool/result', 2, { message: { toolCallId: 'c1', content: [] } }) },
+      { event: event('tool/call', 3, { name: 'edit', arguments: '{"file_path":"src/b.ts","path":"src/a.ts"}', callId: 'c2' }) },
+      { event: event('tool/result', 4, { message: { toolCallId: 'c2', content: [] } }) },
+      { event: event('tool/call', 5, { name: 'read', arguments: '{"path":"src/c.ts"}', callId: 'c3' }) },
+      { event: event('tool/result', 6, { message: { toolCallId: 'c3', content: [] } }) },
     ]
     expect(producedPaths(entries)).toEqual(['src/a.ts', 'src/b.ts'])
+  })
+
+  it('ignores a call whose result has not arrived yet', () => {
+    const entries = [
+      { event: event('tool/call', 1, { name: 'write', arguments: '{"file_path":"pending.ts"}', callId: 'c1' }) },
+    ]
+    expect(producedPaths(entries)).toEqual([])
   })
 
   it('cuts the inherited seed and excludes failed calls', () => {
@@ -275,6 +285,8 @@ describe('fetchTranscript', () => {
         { kind: 'assistant', seq: 2, text: '你好' },
       ],
       produced: [],
+      complete: true,
+      error: false,
     })
   })
 
@@ -320,6 +332,8 @@ describe('fetchTranscript', () => {
         { kind: 'assistant', seq: 111, text: '第二个答案' },
       ],
       produced: [],
+      complete: true,
+      error: false,
     })
   })
 
@@ -338,15 +352,21 @@ describe('fetchTranscript', () => {
         { kind: 'user', seq: 92, text: '问' },
       ],
       produced: [],
+      complete: true,
+      error: false,
     })
   })
 
-  it('reuses the cached seed boundary — later reads fetch one page only', async () => {
+  it('fills the gap between the cached coverage and a newer snapshot', async () => {
     // First read: the walk locates the boundary (page 2 has the end-seed).
     const sessions = remote([
       snapshot([record(event('user/message', 90, { content: [{ type: 'text', text: '旧问' }] })), record(event('assistant/message', 91, { message: { content: [{ type: 'text', text: '旧答' }] } }))], true),
-      snapshot([record(event('user/message', 92, { content: [{ type: 'text', text: '新问' }] })), record(event('assistant/message', 93, { message: { content: [{ type: 'text', text: '新答' }] } }))], false),
-    ], [{ records: [record(event('session/end-seed', 80, {})), record(event('user/message', 81, { content: [{ type: 'text', text: 'Side conversation boundary' }] }))], hasMore: false }])
+      snapshot([record(event('user/message', 92, { content: [{ type: 'text', text: '新问' }] })), record(event('assistant/message', 93, { message: { content: [{ type: 'text', text: '新答' }] } }))], true),
+    ], [
+      { records: [record(event('session/end-seed', 80, {})), record(event('user/message', 81, { content: [{ type: 'text', text: 'Side conversation boundary' }] }))], hasMore: false },
+      // The second read pages back until it overlaps the covered range.
+      { records: [record(event('assistant/message', 91, { message: { content: [{ type: 'text', text: '旧答' }] } }))], hasMore: false },
+    ])
     const first = await fetchTranscript(sessions as never, ADDRESS)
     expect(first).toEqual({
       rows: [
@@ -354,11 +374,13 @@ describe('fetchTranscript', () => {
         { kind: 'assistant', seq: 91, text: '旧答' },
       ],
       produced: [],
+      complete: true,
+      error: false,
     })
     expect(sessions.page).toHaveBeenCalledWith(expect.objectContaining({ beforeSeq: 90 }))
-    // Cached: exactly one fetch, no beforeSeq walk.
     const second = await fetchTranscript(sessions, ADDRESS)
     expect(sessions.follow).toHaveBeenCalledTimes(2)
+    expect(sessions.page).toHaveBeenCalledWith(expect.objectContaining({ beforeSeq: 92 }))
     expect(second).toEqual({
       rows: [
         { kind: 'user', seq: 90, text: '旧问' },
@@ -367,11 +389,63 @@ describe('fetchTranscript', () => {
         { kind: 'assistant', seq: 93, text: '新答' },
       ],
       produced: [],
+      complete: true,
+      error: false,
+    })
+  })
+
+  it('does not treat an activity-discovered boundary as complete transcript coverage', async () => {
+    // The activity read locates the boundary but only reads the tail; the
+    // first transcript read must still walk back to the boundary.
+    const sessions = remote([
+      snapshot([record(event('user/message', 90, { content: [{ type: 'text', text: '旧问' }] })), record(event('assistant/message', 91, { message: { content: [{ type: 'text', text: '旧答' }] } }))], true),
+      snapshot([record(event('user/message', 90, { content: [{ type: 'text', text: '旧问' }] })), record(event('assistant/message', 91, { message: { content: [{ type: 'text', text: '旧答' }] } }))], true),
+    ], [
+      { records: [record(event('session/end-seed', 80, {})), record(event('user/message', 81, { content: [{ type: 'text', text: 'Side conversation boundary' }] }))], hasMore: false },
+      { records: [record(event('session/end-seed', 80, {})), record(event('user/message', 81, { content: [{ type: 'text', text: 'Side conversation boundary' }] }))], hasMore: false },
+    ])
+    const activity = await fetchActivity(sessions as never, ADDRESS)
+    expect(activity).toBe('旧答')
+    const transcript = await fetchTranscript(sessions as never, ADDRESS)
+    expect(sessions.page).toHaveBeenCalledTimes(2)
+    expect(transcript).toEqual({
+      rows: [
+        { kind: 'user', seq: 90, text: '旧问' },
+        { kind: 'assistant', seq: 91, text: '旧答' },
+      ],
+      produced: [],
+      complete: true,
+      error: false,
+    })
+  })
+
+  it('keeps the previous coverage when a page fails mid-gap', async () => {
+    const sessions = remote([
+      snapshot([record(event('user/message', 90, { content: [{ type: 'text', text: '旧问' }] })), record(event('assistant/message', 91, { message: { content: [{ type: 'text', text: '旧答' }] } }))], true),
+      snapshot([record(event('user/message', 92, { content: [{ type: 'text', text: '新问' }] }))], true),
+    ], [
+      { records: [record(event('session/end-seed', 80, {})), record(event('user/message', 81, { content: [{ type: 'text', text: 'Side conversation boundary' }] }))], hasMore: false },
+    ])
+    const first = await fetchTranscript(sessions as never, ADDRESS)
+    expect(first?.complete).toBe(true)
+    // The second read's page request fails (the queue is empty).
+    const second = await fetchTranscript(sessions, ADDRESS)
+    expect(second).toEqual({
+      rows: [
+        { kind: 'user', seq: 90, text: '旧问' },
+        { kind: 'assistant', seq: 91, text: '旧答' },
+      ],
+      produced: [],
+      complete: false,
+      error: true,
     })
   })
 
   it('extracts produced files from alpha tool arguments', async () => {
-    const sessions = remote([snapshot([record(event('tool/call', 1, { name: 'write', arguments: '{"file_path":"/w/src/a.ts"}' }))], false)], [])
+    const sessions = remote([snapshot([
+      record(event('tool/call', 1, { name: 'write', arguments: '{"file_path":"/w/src/a.ts"}', callId: 'c1' })),
+      record(event('tool/result', 2, { message: { toolCallId: 'c1', content: [] } })),
+    ], false)], [])
     const result = await fetchTranscript(sessions as never, ADDRESS)
     expect(result).toEqual({
       rows: [{
@@ -379,6 +453,8 @@ describe('fetchTranscript', () => {
         detail: { arguments: '{"file_path":"/w/src/a.ts"}' },
       }],
       produced: ['/w/src/a.ts'],
+      complete: true,
+      error: false,
     })
   })
 

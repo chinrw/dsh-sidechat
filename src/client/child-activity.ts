@@ -21,7 +21,9 @@ export type CatalogActivity = 'running' | 'inactive'
 export interface ChildActivityInput {
   /** Parent catalog snapshot state: `absent` means no catalog has been fetched. */
   catalogState: CatalogState
-  /** The child's own catalog activity when it appears in the catalog list. */
+  /** Whether the child appears in the parent's catalog list. */
+  inCatalog: boolean
+  /** The child's own catalog activity when the catalog reports one. */
   catalogActivity: CatalogActivity | undefined
   /** Session summary running bit for the child (most reliable; host-updated). */
   summaryRunning: boolean | undefined
@@ -34,9 +36,12 @@ export interface ChildActivityInput {
  * 1. A session summary running bit is the most reliable signal (the host
  *    pushes it on session frames). When present, it is authoritative.
  * 2. Otherwise the catalog entry's activity is used.
- * 3. A catalog that finished loading and is missing the child means the
+ * 3. A child that is in the catalog but has no activity signal yet is
+ *    `unknown`: it exists, so reporting it as finished would hide a running
+ *    child.
+ * 4. A catalog that finished loading and is missing the child means the
  *    child is no longer in the parent's membership feed: `inactive`.
- * 4. Anything else (catalog not fetched, loading, or errored) is `unknown`.
+ * 5. Anything else (catalog not fetched, loading, or errored) is `unknown`.
  *
  * The `unknown` state must never drive a poll loop or a waiting hint; both
  * conditions require an explicit `running`.
@@ -50,6 +55,9 @@ export function resolveChildActivity(input: ChildActivityInput): ChildActivity {
   }
   if (input.catalogActivity !== undefined) {
     return input.catalogActivity
+  }
+  if (input.inCatalog) {
+    return 'unknown'
   }
   if (input.catalogState === 'ready') {
     return 'inactive'

@@ -5,8 +5,9 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { CommandNode } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { apply } from '../src/client/index'
-import { observeCreatedChildren, resolveChildSessionId } from '../src/client/SideCommandCard'
+import { observeCreatedChildren, resolveChildSessionId, shouldOpenCreatedChild } from '../src/client/SideCommandCard'
 import { SIDECHAT_STYLE_CSS } from '../src/client/style'
 
 const CHILD_ID = '54c34e5e-1c29-4a6c-a2f7-4b19a3d92914'
@@ -96,6 +97,32 @@ describe('observeCreatedChildren', () => {
       node({ time: 20, commandId: 'cmd-3' as CommandNode['commandId'], name: 'compact', outcome: { kind: 'success' } }),
     ], 10)
     expect(observed.children).toEqual([])
+  })
+})
+
+describe('shouldOpenCreatedChild', () => {
+  it('opens a command the card watched run', () => {
+    expect(shouldOpenCreatedChild({
+      child: CHILD_ID as SessionId, pendingSeen: true, alreadyOpened: false,
+    })).toBe(true)
+  })
+
+  it('does not open a command that was already settled at first render', () => {
+    expect(shouldOpenCreatedChild({
+      child: CHILD_ID as SessionId, pendingSeen: false, alreadyOpened: false,
+    })).toBe(false)
+  })
+
+  it('opens at most once per command', () => {
+    expect(shouldOpenCreatedChild({
+      child: CHILD_ID as SessionId, pendingSeen: true, alreadyOpened: true,
+    })).toBe(false)
+  })
+
+  it('does not open without a created child', () => {
+    expect(shouldOpenCreatedChild({
+      child: undefined, pendingSeen: true, alreadyOpened: false,
+    })).toBe(false)
   })
 })
 
@@ -206,7 +233,7 @@ describe('client apply wiring', () => {
       maxMessages: 8,
       assistantStream: true,
     })
-    expect(transcript).toEqual({ rows: [], produced: [] })
+    expect(transcript).toEqual({ rows: [], produced: [], complete: true, error: false })
     // The activity line reads a lighter tail page; an empty log yields null.
     const activityLine = await injected.readActivity!(address)
     expect(follow).toHaveBeenCalledWith({
